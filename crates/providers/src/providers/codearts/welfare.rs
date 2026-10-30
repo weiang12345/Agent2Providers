@@ -60,6 +60,8 @@ pub const MAX_ATTEMPTS_PER_DAY: i64 = 6;
 pub const MIN_ATTEMPT_GAP: Duration = Duration::from_secs(10 * 60);
 /// 活动列表按哪个时区算「今天」：上游的活动周期是北京时间零点。
 const DAY_ZONE_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+/// 一整天（毫秒），供日池重置边界换算。
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// 一个活动条目。`id` 保持上游给的**原始 JSON**（字符串或数字都出现过），
 /// 发回 claim 请求时必须原样带回，转成字符串再发就会改变 JSON 类型。
@@ -72,6 +74,14 @@ pub struct Campaign {
     pub status: String,
     pub benefit_amount: f64,
     pub benefit_unit: String,
+}
+
+/// `now_ms` 之后最近的北京时间零点（毫秒时间戳）。
+///
+/// 福利日池按北京零点重置；`div_euclid` 避免负时间戳整除方向不一致。
+pub fn next_day_boundary_ms(now_ms: i64) -> i64 {
+    let shifted = now_ms + i64::from(DAY_ZONE_OFFSET_SECONDS) * 1000;
+    shifted.div_euclid(DAY_MS) * DAY_MS + DAY_MS - i64::from(DAY_ZONE_OFFSET_SECONDS) * 1000
 }
 
 impl Campaign {

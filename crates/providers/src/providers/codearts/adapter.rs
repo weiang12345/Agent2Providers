@@ -434,13 +434,13 @@ impl Provider for CodeArtsProvider {
         let message = format!("上游返回 {status}{}", raw_part(raw));
         match status {
             403 => proto::ErrorClass::QuotaLimited {
-                reset_at: None,
+                reset_at: daily_pool_reset_at(logging::now_ms(), &message),
                 message,
                 upstream_code: None,
                 status,
             },
             429 => proto::ErrorClass::QuotaLimited {
-                reset_at: None,
+                reset_at: daily_pool_reset_at(logging::now_ms(), &message),
                 message,
                 upstream_code: None,
                 status,
@@ -777,6 +777,13 @@ fn raw_part(raw: &str) -> String {
     }
 }
 
+/// 只有明确的福利日池耗尽才冷却到北京零点；普通权限/限流仍走默认短冷却。
+fn daily_pool_reset_at(now_ms: i64, message: &str) -> Option<i64> {
+    let text = message.to_ascii_lowercase();
+    (text.contains("insufficient quota") || text.contains("4291.200"))
+        .then(|| welfare::next_day_boundary_ms(now_ms))
+}
+
 /// `welfare::Outcome` → `CheckinReport`。
 ///
 /// 四档结论在「今天还能不能再领」这件事上分三类，映射必须与网关的
@@ -806,5 +813,38 @@ fn welfare_report(outcome: welfare::Outcome) -> proto::CheckinReport {
             streak: None,
             message: Some(label),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quota_envelope_cools_to_the_daily_boundary() {
+        let now = logging::now_ms();
+        let body = serde_json::json!({
+            "error_msg": "InferHub.4291.200: insufficient quota"
+        });
+        let proto::ErrorClass::QuotaLimited { reset_at, .. } = CODEARTS.classify(403, &body)
+        else {
+            panic!("额度信封应分类为 QuotaLimited");
+        };
+        assert_eq!(Some(welfare::next_day_boundary_ms(now)), reset_at);
+    }
+
+    #[test]
+    fn permission_and_rate_limit_do_not_take_the_daily_pool_reset() {
+        let now = logging::now_ms();
+        for (status, raw) in [(403, "permission denied"), (429, "too many requests")] {
+            let body = serde_json::json!({ "message": raw });
+            let proto::ErrorClass::QuotaLimited { reset_at, .. } =
+                CODEARTS.classify(status, &body)
+            else {
+                panic!("{status} 的拒绝应分类为 QuotaLimited");
+            };
+            assert_eq!(None, reset_at, "{raw} 不应按日池冷却");
+        }
+        assert_eq!(None, daily_pool_reset_at(now, "上游返回 403: permission denied"));
     }
 }
