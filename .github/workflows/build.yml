@@ -35,6 +35,7 @@ on:
 
 jobs:
   dispatch:
+    if: github.repository == 'ProvidersPlugin/Agent2Providers'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}

@@ -1,0 +1,86 @@
+name: fork release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Validate tag and manifest version
+        shell: pwsh
+        run: |
+          $manifest = Get-Content pack.json -Raw | ConvertFrom-Json
+          $expected = "v$($manifest.version)"
+          if ($env:GITHUB_REF_NAME -ne $expected) {
+            throw "Tag $env:GITHUB_REF_NAME does not match pack.json version $expected"
+          }
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+      - name: Build Windows provider binary
+        run: cargo build --release --locked -p agent2api-providers
+
+      - name: Verify provider protocol
+        run: node scripts/verify.mjs --exe target/release/agent2api-providers.exe
+
+      - name: Pack Windows provider plugin
+        run: node scripts/pack.mjs --target x86_64-pc-windows-msvc --out dist --skip-build
+
+      - name: Sign provider plugin
+        uses: ./.github/actions/sign-pack
+        with:
+          key: ${{ secrets.AGENT2API_PLUGIN_KEY }}
+
+      - name: Validate signed package
+        shell: pwsh
+        run: |
+          $manifest = Get-Content pack.json -Raw | ConvertFrom-Json
+          $zip = Get-ChildItem dist/*.zip | Select-Object -First 1
+          if (-not $zip) { throw "No Windows plugin zip was produced" }
+          if ($zip.Name -ne "agent2api-providers-$($manifest.version)-x86_64-pc-windows-msvc.zip") {
+            throw "Unexpected package name: $($zip.Name)"
+          }
+          $checkDir = Join-Path $env:RUNNER_TEMP "plugin-package-check"
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $checkDir -Force
+          $packed = Get-Content (Join-Path $checkDir "pack.json") -Raw | ConvertFrom-Json
+          if ($packed.version -ne $manifest.version) { throw "Packed version mismatch" }
+          if (-not $packed.signature -or $packed.signature.algorithm -ne "ed25519") {
+            throw "Plugin package is not signed"
+          }
+          Get-FileHash $zip.FullName -Algorithm SHA256 | Format-List
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          prerelease: true
+          generate_release_notes: true
