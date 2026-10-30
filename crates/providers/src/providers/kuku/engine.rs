@@ -19,62 +19,68 @@
 //!     宿主进程** —— 那两件事都是「进程级副作用」，与插件「一次请求一个
 //!     spawn 的沙箱」相反。
 //!
-//! 所以这里**只保留换发的 HTTP 部分**，参数体退化成「最简形态」（只有
-//! `appid` / `bduss` / `ptoken` / `return_type` / `tpl`，没有 `sig`）。
-//! 上游对缺 `sig` 的响应实测是 `errno=-6`（拒绝），**不假装成功** ——
-//! 调用方按 `Err` 处理，回退到「用原 STOKEN 继续」（与网关那份「换发失败
-//! 只记日志、不阻断」的取向一致）。
-//!
-//! ── 这条降级的实际影响 ──────────────────────────────────────
-//! 只影响「网页登录 / 手粘 Cookie 的账号」，且只影响**业务接口**（对话、
-//! 目录、签到）；余额、桌面端导入的账号（客户端 Cookies 里带的就是业务
-//! STOKEN）都不受影响。要让这条链在插件里恢复完整能力，需要给插件开
-//! `Win32_System_LibraryLoader` + `Win32_System_Registry` 两个 feature
-//! 并接受「映射原生 DLL」—— 那是一个需要单独决策的事。
+//! 换发参数使用 KukuAI 客户端引擎的纯算法签名：签名字段是
+//! `appid / bduss / ptoken / return_type / tpl / tpl_list`，追加内置
+//! `sign_key` 后做 MD5。这样插件不需要加载 `genflowengine.dll`。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
+use md5::{Digest as _, Md5};
 use serde_json::Value;
 
 use crate::errors::GatewayError;
 use crate::http::{control_client, describe_chain};
 
-use super::USER_AGENT;
-
 /// 换发端点（passport 的 v3 登录 API）
 const PASSPORT_AUTH_URL: &str = "https://passport.baidu.com/v3/login/api/auth";
+
+/// KukuAI 官方客户端引擎内置签名密钥
+const ENGINE_SIGN_KEY: &str = "34868b316de55815273b2616954b0286";
+
+/// passport 换发接口对客户端引擎 UA 敏感，浏览器 UA 不可靠。
+const ENGINE_UA: &str = "genflow;1.6.5;PC;PC-Windows;10.0.26200;GenFlowPro";
+
+/// 构造 passport 换发用的签名参数体。
+fn build_auth_param(bduss: &str, ptoken: &str) -> String {
+    let signed = format!(
+        "appid=1&bduss={bduss}&ptoken={ptoken}&return_type=1&tpl=genflowpro&\
+         tpl_list=genflowpro|netdisk&sign_key={ENGINE_SIGN_KEY}"
+    );
+    let mut hasher = Md5::new();
+    hasher.update(signed.as_bytes());
+    let signature = format!("{:x}", hasher.finalize());
+    format!(
+        "appid=1&bduss={bduss}&ptoken={ptoken}&return_type=1&tpl=genflowpro&\
+         tpl_list=genflowpro|netdisk&sig={signature}"
+    )
+}
 
 /// 用 BDUSS + PTOKEN 换发「genflowpro 作用域」的 STOKEN。
 ///
 /// 成功返回新 STOKEN；失败（缺材料 / 没有引擎 / 被拒）返回带可读原因的错误，
 /// 由调用方决定回退方式（本项目的口径是「只记日志，用原凭证继续」）。
-pub async fn exchange_genflowpro_stoken(
-    bduss: &str,
-    ptoken: &str,
-) -> Result<String, GatewayError> {
+pub async fn exchange_genflowpro_stoken(bduss: &str, ptoken: &str) -> Result<String, GatewayError> {
     if bduss.trim().is_empty() || ptoken.trim().is_empty() {
         return Err(GatewayError::with_status(
             400,
             "换发 KukuAI 会话令牌需要 BDUSS 与 PTOKEN（登录 Cookie 里缺 PTOKEN）",
         ));
     }
-    // ── 参数体：没有 sig（见模块头）────────────────────────────
-    let body = format!(
-        "appid=1&bduss={}&ptoken={}&return_type=1&tpl=genflowpro&tpl_list=genflowpro",
-        encode(bduss),
-        encode(ptoken)
-    );
+    let body = build_auth_param(bduss, ptoken);
     // ── 为什么不用 `http::send_raw` ──────────────────────────────
     // 那个函数的 body 是 `Option<&Value>`，会按 JSON 发；passport 只认
     // `application/x-www-form-urlencoded`（发错编码的表现是 400
     // `invalid_request`，与「凭证不对」难以区分）。这里直发一次。
     let response = control_client(None, "direct")
         .post(PASSPORT_AUTH_URL)
-        .header("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
+        .header(
+            "Content-Type",
+            "application/x-www-form-urlencoded;charset=UTF-8",
+        )
         .header("Referer", format!("{}/genflowpro", super::BASE_URL))
         .header("Origin", super::BASE_URL)
-        .header("User-Agent", USER_AGENT)
+        .header("User-Agent", ENGINE_UA)
         .body(body)
         .timeout(std::time::Duration::from_secs(20))
         .send()
@@ -121,21 +127,23 @@ pub async fn exchange_genflowpro_stoken(
     Ok(stoken)
 }
 
-/// 最小百分号编码（只编表单里有特殊含义的字符）
-fn encode(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.as_bytes() {
-        match byte {
-            b'&' | b'=' | b'+' | b'%' | b'#' | b' ' => {
-                out.push('%');
-                out.push_str(&format!("{byte:02X}"));
-            }
-            0x00..=0x1f | 0x7f => {
-                out.push('%');
-                out.push_str(&format!("{byte:02X}"));
-            }
-            _ => out.push(*byte as char),
-        }
+#[cfg(test)]
+mod tests {
+    use super::build_auth_param;
+
+    #[test]
+    fn auth_param_matches_dll_signature_vectors() {
+        let bduss = "A".repeat(192);
+        let ptoken = "P".repeat(64);
+        let body = build_auth_param(&bduss, &ptoken);
+        assert_eq!(
+            body,
+            format!(
+                "appid=1&bduss={bduss}&ptoken={ptoken}&return_type=1&tpl=genflowpro&\
+                 tpl_list=genflowpro|netdisk&sig=9cf3a33e3b6f19324853970abf2d00a2"
+            )
+        );
+        assert!(build_auth_param(&"X".repeat(192), &"Y".repeat(64))
+            .ends_with("&sig=a3d861ea0946b617a7235b6b36c65add"));
     }
-    out
 }

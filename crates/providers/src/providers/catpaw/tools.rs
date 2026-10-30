@@ -112,7 +112,10 @@ pub fn normalize_tools(tools: Option<&Value>) -> Result<Vec<Value>, CatPawError>
                 Some(false) => {}
             }
         }
-        let name = function.get("name").and_then(Value::as_str).unwrap_or_default();
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if name.is_empty()
             || name.len() > 128
             || !name
@@ -193,13 +196,13 @@ pub fn select_tools(all: &[Value], choice: &ToolChoice) -> Result<Vec<Value>, Ca
     }
 }
 
-/// JSON 值合法性校验（原实现 `validateJsonValue`）：嵌套深度 ≤12、
+/// JSON 值合法性校验（原实现 `validateJsonValue`）：嵌套深度 ≤64、
 /// 对象内不允许 `__proto__` / `constructor` / `prototype` 三个键。
 ///
 /// 为什么网关也要挡这三个键：它们会一路进上游 JSON（上游是 JS 生态，
 /// 原型污染是真实攻击面），且这类输入没有任何正常用途。
 fn validate_json_value(value: &Value, path: &str, depth: usize) -> Result<(), CatPawError> {
-    if depth > 12 {
+    if depth > 64 {
         return Err(CatPawError::bad_request(format!("{path} 嵌套过深")));
     }
     match value {
