@@ -85,7 +85,7 @@ jobs:
           sudo ln -sf "$ZIG_REAL" /usr/local/bin/zig
           cargo install --locked "cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}"
           zig version
-          cargo zigbuild --version
+          cargo-zigbuild --version
 
       - name: 交叉编译 armv7
         run: |
