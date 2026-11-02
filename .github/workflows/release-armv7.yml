@@ -70,9 +70,19 @@ jobs:
       - name: 安装 zig 与 cargo-zigbuild
         run: |
           set -euo pipefail
-          python -m pip install --disable-pip-version-check --user --break-system-packages "ziglang==${ZIG_VERSION}"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
+          # pip 的 ziglang wheel 在 runner 上不一定产出 $HOME/.local/bin/zig，
+          # 直接用官方 tarball，落地位置可控；0.17.0 尚未发布时回退到 0.14.1。
+          ZIG_REAL=""
+          for v in "${ZIG_VERSION}" 0.14.1; do
+            url="https://ziglang.org/download/${v}/zig-x86_64-linux-${v}.tar.xz"
+            if curl -fsSL "$url" -o "$RUNNER_TEMP/zig.tar.xz"; then
+              tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+              ZIG_REAL="$RUNNER_TEMP/zig-x86_64-linux-${v}/zig"
+              break
+            fi
+          done
+          test -x "$ZIG_REAL"
+          sudo ln -sf "$ZIG_REAL" /usr/local/bin/zig
           cargo install --locked "cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}"
           zig version
           cargo zigbuild --version
