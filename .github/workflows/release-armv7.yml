@@ -72,6 +72,7 @@ jobs:
           set -euo pipefail
           python -m pip install --disable-pip-version-check --user --break-system-packages "ziglang==${ZIG_VERSION}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
           cargo install --locked "cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}"
           zig version
           cargo zigbuild --version
