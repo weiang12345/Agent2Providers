@@ -202,6 +202,7 @@
     "x86_64-pc-windows-msvc": "bin/agent2api-providers.exe",
     "x86_64-unknown-linux-gnu": "bin/agent2api-providers",
     "aarch64-unknown-linux-gnu": "bin/agent2api-providers",
+    "armv7-unknown-linux-gnu": "bin/agent2api-providers",
     "x86_64-apple-darwin": "bin/agent2api-providers",
     "aarch64-apple-darwin": "bin/agent2api-providers"
   },

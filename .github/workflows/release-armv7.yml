@@ -1,0 +1,150 @@
+name: release-armv7
+
+# 只给 32 位 ARM（armv7 / armhf）出包。
+#
+# ── 为什么是独立的一条 workflow ──────────────────────────────
+# 上游主仓库的 `build.yml` 只做一件事：把 `v*` tag 派发给专用构建账号
+# （`Agent2Builder/agent2api-providers-releases`），那边的矩阵是固定的
+# 5 个平台，publish job 还有「必须恰好 5 个包」的硬校验。armv7 是官方索引
+# 里根本不存在的平台，塞进那条链路会把上游发版逻辑改乱。所以这里单独一条：
+# 本仓库自己交叉编译、自己打包、自己发 Release，与上游零耦合。
+#
+# ── 产物形状 ────────────────────────────────────────────────
+# `agent2api-providers-<版本>-armv7-unknown-linux-gnu.zip`，**未签名**
+# （本仓库没有 `AGENT2API_PLUGIN_KEY`，签名私钥只在官方构建账号里）。
+# 网关允许安装未签名包（界面标黄），但自动补齐/自动安装只收签名包 ——
+# 所以这个包只能「从文件安装」。
+#
+# 三元组写成 `armv7-unknown-linux-gnu` 是为了与网关 `target_triple()`
+# 逐字一致：32 位 ARM 上 `std::env::consts::ARCH` 只给 `"arm"`，拼出来的
+# `arm-unknown-linux-gnu` 在 Rust 里不存在，任何 `pack.json` 的 `entry`
+# 都不会有这一项，于是插件页永远显示「当前平台暂无包」。
+#
+# ── 为什么用 zig 交叉编译 ───────────────────────────────────
+# 依赖里 `rusqlite`（bundled SQLite）、`ring`、`flate2` 都要为目标架构编
+# C/汇编。zig 自带交叉用 libc 与 cc，省掉装 armhf binutils + sysroot。
+# Rust / zig / cargo-zigbuild 三个版本都钉死成本机验证过的那一组。
+#
+# ── 验证为什么不省 ──────────────────────────────────────────
+# `scripts/verify.mjs` 是「脚本扮演网关、直接对插件二进制跑协议」，能抓到
+# 「能编译、能打包、跑起来 exec format error / 握手失败」这类只在真机才
+# 暴露的问题。runner 是 x86_64，所以先注册 binfmt 让 armv7 二进制可执行。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag（留空则自动取 v<pack.json 版本>-armv7.<run_number>）'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  # 编译用的 Rust 目标（musl 静态，宿主上按独立进程跑）
+  RUST_TARGET: armv7-unknown-linux-musleabihf
+  # 打包用的三元组（与网关 `target_triple()` 逐字一致，见文件头注释）
+  PACK_TARGET: armv7-unknown-linux-gnu
+  RUST_VERSION: '1.98.1'
+  ZIG_VERSION: '0.17.0'
+  CARGO_ZIGBUILD_VERSION: '0.24.0'
+
+jobs:
+  armv7:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装 Rust 工具链与 armv7 目标
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: armv7-unknown-linux-musleabihf
+
+      - name: 安装 zig 与 cargo-zigbuild
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --user --break-system-packages "ziglang==${ZIG_VERSION}"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          cargo install --locked "cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}"
+          zig version
+          cargo zigbuild --version
+
+      - name: 交叉编译 armv7
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release -p agent2api-providers --target "$RUST_TARGET"
+          file "target/$RUST_TARGET/release/agent2api-providers"
+
+      - name: 注册 qemu binfmt（让 armv7 二进制能在 runner 上直接跑）
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: 协议握手验证
+        env:
+          VERIFY_TARGET: ${{ env.PACK_TARGET }}
+        run: |
+          set -euo pipefail
+          node scripts/verify.mjs --exe "target/$RUST_TARGET/release/agent2api-providers"
+
+      - name: 打包
+        run: |
+          set -euo pipefail
+          # pack.mjs 按打包三元组查找 target/<triple>/release/；编译用的是
+          # musl 三元组，所以先把已通过协议验证的同一份二进制放到预期路径。
+          mkdir -p "target/$PACK_TARGET/release"
+          cp "target/$RUST_TARGET/release/agent2api-providers" \
+             "target/$PACK_TARGET/release/agent2api-providers"
+          node scripts/pack.mjs --skip-build --target "$PACK_TARGET" --out dist
+          sha256sum dist/*.zip | tee dist/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent2api-providers-${{ env.PACK_TARGET }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: 发 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./pack.json').version")"
+          TAG="${INPUT_TAG:-v${VERSION}-armv7.${GITHUB_RUN_NUMBER}}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::Release $TAG 已存在，换一个 tag 再跑"
+            exit 1
+          fi
+          cat > "$RUNNER_TEMP/notes.md" <<NOTES
+          32 位 ARM（armv7-unknown-linux-gnu）插件包，由 fork 仓库交叉编译。
+
+          - 打包目标：armv7-unknown-linux-gnu（与网关 target_triple() 逐字一致）
+          - 编译目标：armv7-unknown-linux-musleabihf（静态，硬浮点）
+          - 未签名：网关允许安装并在界面标黄；自动补齐只收官方签名包，请从文件安装
+          - 校验和见 SHA256SUMS.txt
+          NOTES
+          gh release create "$TAG" dist/*.zip dist/SHA256SUMS.txt \
+            --title "armv7 ${VERSION}" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --prerelease
+
+      - name: 写入 job summary
+        run: |
+          set -euo pipefail
+          {
+            echo '### armv7 插件包'
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

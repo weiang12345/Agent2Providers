@@ -45,7 +45,7 @@ const DEFAULT_EXE = path.join(
  *  脚本扮演网关，要在 `init` 的 env 里报 `target` —— 写死 `x86_64-windows`
  *  会让插件在 Linux/macOS 上按错误的平台解析自己的路径（qoder 的组件缓存、
  *  paths 的临时目录分支都读它），验证结果就不可信了。 */
-const TARGET = (() => {
+const TARGET = process.env.VERIFY_TARGET || (() => {
   const arch = process.arch === 'x64' ? 'x86_64' : process.arch === 'arm64' ? 'aarch64' : process.arch
   switch (process.platform) {
     case 'win32': return `${arch}-pc-windows-msvc`
